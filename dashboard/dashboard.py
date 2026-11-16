@@ -1,30 +1,21 @@
 import json
 from pathlib import Path
 
+import altair as alt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
-from matplotlib.colors import LogNorm, Normalize
-from matplotlib.patches import Polygon
-import seaborn as sns
 import streamlit as st
 
 # ---------------------------------------------------------------------------
 # Konfigurasi
 # ---------------------------------------------------------------------------
+# Semua grafik memakai Altair (Vega-Lite) yang digambar langsung di browser,
+# sehingga tidak bergantung pada file gambar sementara di server.
 BASE_DIR = Path(__file__).resolve().parent
-MAIN, ACCENT, GREY, TEXT = "#2a78d6", "#eb6834", "#c9c8c2", "#52514e"
+MAIN, ACCENT, GREY, LABEL = "#2a78d6", "#eb6834", "#b4b3ad", "#808080"
 
 st.set_page_config(page_title="E-Commerce Dashboard", page_icon="🛒", layout="wide")
-sns.set_theme(style="whitegrid")
-plt.rcParams.update({
-    "axes.titlesize": 13,
-    "axes.titleweight": "bold",
-    "axes.titlelocation": "left",
-    "axes.edgecolor": "#d9d8d3",
-    "grid.color": "#ecebe7",
-})
+alt.data_transformers.disable_max_rows()
 
 DELAY_BINS = [-np.inf, 0, 3, 7, 14, 30, np.inf]
 DELAY_LABELS = ["Tepat waktu", "Telat 1-3 hari", "Telat 4-7 hari",
@@ -133,36 +124,16 @@ def polygon_centroid(ring):
     return ((x + np.roll(x, -1)) * cross).sum() / (6 * area), ((y + np.roll(y, -1)) * cross).sum() / (6 * area)
 
 
-def draw_choropleth(values, label, log=False):
-    geo = load_geojson()
-    fig, ax = plt.subplots(figsize=(7, 7))
-    cm = plt.get_cmap("Blues")
-    vmin, vmax = values.min(), values.max()
-    if vmin == vmax:
-        vmin, vmax = vmin * 0.9, vmax * 1.1 + 1e-9
-    norm = LogNorm(max(vmin, 1e-3), vmax) if log else Normalize(vmin, vmax)
-    for feat in geo["features"]:
-        uf = feat["properties"]["sigla"]
+@st.cache_data
+def state_centroids():
+    rows = []
+    for feat in load_geojson()["features"]:
         geom = feat["geometry"]
         polys = geom["coordinates"] if geom["type"] == "MultiPolygon" else [geom["coordinates"]]
-        has_value = uf in values.index and pd.notna(values[uf])
-        face = cm(norm(values[uf])) if has_value else "#f4f4f2"
-        for poly in polys:
-            ax.add_patch(Polygon(poly[0], closed=True, facecolor=face, edgecolor="white", linewidth=0.8))
         largest = max(polys, key=lambda p: abs(np.ptp(np.array(p[0]), axis=0).prod()))
-        cx, cy = polygon_centroid(largest[0])
-        dark = has_value and norm(values[uf]) > 0.6
-        ax.text(cx, cy, uf, ha="center", va="center", fontsize=7, color="white" if dark else "#0b0b0b")
-    ax.set_xlim(-75, -33)
-    ax.set_ylim(-34.5, 6)
-    ax.set_aspect("equal")
-    ax.axis("off")
-    cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cm), ax=ax, shrink=0.6, pad=0.01)
-    cbar.set_label(label)
-    cbar.outline.set_visible(False)
-    if log:
-        cbar.ax.yaxis.set_major_formatter(mtick.FuncFormatter(lambda v, pos: f"{v:,.0f}"))
-    return fig
+        lon, lat = polygon_centroid(largest[0])
+        rows.append({"state": feat["properties"]["sigla"], "lon": lon, "lat": lat})
+    return pd.DataFrame(rows)
 
 
 def fmt_brl(value):
@@ -171,6 +142,95 @@ def fmt_brl(value):
     if value >= 1e3:
         return f"R${value / 1e3:,.1f}K"
     return f"R${value:,.0f}"
+
+
+# ---------------------------------------------------------------------------
+# Helper: grafik Altair
+# ---------------------------------------------------------------------------
+BRL_AXIS = "'R$' + format(datum.value / 1000, ',.0f') + 'K'"
+
+
+def show_chart(chart):
+    """Tampilkan grafik selebar container (kompatibel Streamlit lama & baru)."""
+    try:
+        st.altair_chart(chart, width="stretch")
+    except TypeError:
+        st.altair_chart(chart, use_container_width=True)
+
+
+def line_chart(df, field, title, axis_label_expr=None, tooltip_format=",.0f"):
+    peak_month = df.loc[df["revenue"].idxmax(), "month"]
+    data = df.assign(is_peak=df["month"] == peak_month)
+    axis = alt.Axis(labelExpr=axis_label_expr) if axis_label_expr else alt.Axis(format=",.0f")
+    base = alt.Chart(data).encode(
+        x=alt.X("month:T", title=None, axis=alt.Axis(format="%b %Y", labelAngle=0)),
+        y=alt.Y(f"{field}:Q", title=title, axis=axis),
+        tooltip=[alt.Tooltip("month:T", title="Bulan", format="%B %Y"),
+                 alt.Tooltip(f"{field}:Q", title=title, format=tooltip_format)],
+    )
+    line = base.mark_line(color=MAIN, strokeWidth=2, point=alt.OverlayMarkDef(color=MAIN, size=45))
+    peak = base.transform_filter(alt.datum.is_peak).mark_point(color=ACCENT, filled=True, size=160, opacity=1)
+    return (line + peak).properties(height=260, title=title)
+
+
+def hbar_chart(df, cat_col, val_col, x_title, label_col, tooltip,
+               highlight=(), highlight_color=MAIN, base_color=GREY):
+    """Bar horizontal berurutan; kategori di `highlight` diberi warna penekanan."""
+    order = df[cat_col].tolist()
+    x_max = float(df[val_col].max()) if len(df) else 1.0
+    base = alt.Chart(df).encode(
+        y=alt.Y(f"{cat_col}:N", sort=order, title=None,
+                axis=alt.Axis(labelLimit=220, labelOverlap=False)),
+        x=alt.X(f"{val_col}:Q", title=x_title, scale=alt.Scale(domain=[0, (x_max or 1.0) * 1.35])),
+        tooltip=tooltip,
+    )
+    if highlight:
+        color = alt.condition(alt.FieldOneOfPredicate(field=cat_col, oneOf=list(highlight)),
+                              alt.value(highlight_color), alt.value(base_color))
+    else:
+        color = alt.value(base_color)
+    bars = base.mark_bar(cornerRadiusEnd=3).encode(color=color)
+    labels = base.mark_text(align="left", dx=4, color=LABEL, fontSize=11).encode(text=f"{label_col}:N")
+    return (bars + labels).properties(height=max(34 * len(df), 200))
+
+
+def vbar_chart(df, cat_col, val_col, y_title, y_domain, label_col, tooltip):
+    base = alt.Chart(df).encode(
+        x=alt.X(f"{cat_col}:N", sort=df[cat_col].tolist(), title="Keterlambatan dari estimasi",
+                axis=alt.Axis(labelAngle=0, labelOverlap=False, labelLimit=120,
+                              labelExpr="replace(datum.label, 'Telat ', '')")),
+        y=alt.Y(f"{val_col}:Q", title=y_title, scale=alt.Scale(domain=y_domain)),
+        tooltip=tooltip,
+    )
+    bars = base.mark_bar(cornerRadiusEnd=3).encode(
+        color=alt.condition(alt.FieldOneOfPredicate(field=cat_col, oneOf=[DELAY_LABELS[0]]),
+                            alt.value(MAIN), alt.value(ACCENT)))
+    labels = base.mark_text(dy=-8, color=LABEL, fontSize=12).encode(text=f"{label_col}:N")
+    return (bars + labels).properties(height=320)
+
+
+def choropleth(state_values, title, log=False):
+    geo = alt.Data(values=load_geojson()["features"])
+    values_df = pd.DataFrame({"customer_state": state_values.index, "value": state_values.values})
+    if log:
+        values_df = values_df[values_df["value"] > 0]
+
+    background = alt.Chart(geo).mark_geoshape(fill="#e9e8e4", stroke="white", strokeWidth=0.7)
+    colored = (alt.Chart(geo)
+               .mark_geoshape(stroke="white", strokeWidth=0.7)
+               .transform_lookup(lookup="properties.sigla",
+                                 from_=alt.LookupData(values_df, "customer_state", ["value"]))
+               .transform_filter("isValid(datum.value)")
+               .encode(color=alt.Color("value:Q", title=title,
+                                       scale=alt.Scale(type="log" if log else "linear", scheme="blues")),
+                       tooltip=[alt.Tooltip("properties.name:N", title="State"),
+                                alt.Tooltip("properties.sigla:N", title="Kode"),
+                                alt.Tooltip("value:Q", title=title, format=",.2f")]))
+    halo = (alt.Chart(state_centroids())
+            .mark_text(fontSize=9, fontWeight="bold", stroke="#1f1f1f", strokeWidth=2.5, color="#1f1f1f")
+            .encode(longitude="lon:Q", latitude="lat:Q", text="state:N"))
+    labels = halo.mark_text(fontSize=9, fontWeight="bold", color="white")
+    return (background + colored + halo + labels).project("mercator").properties(height=560)
 
 
 # ---------------------------------------------------------------------------
@@ -235,24 +295,14 @@ with tab_trend:
         st.info("Pilih rentang waktu minimal dua bulan untuk melihat tren.")
     peak = monthly_df.loc[monthly_df["revenue"].idxmax()]
     st.markdown(f"Revenue tertinggi pada **{peak['month']:%B %Y}**: **{fmt_brl(peak['revenue'])}** "
-                f"dari **{int(peak['order_count']):,}** pesanan.")
+                f"dari **{int(peak['order_count']):,}** pesanan (titik oranye).")
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 6.5), sharex=True)
-    for ax, col, title in [(axes[0], "order_count", "Jumlah pesanan per bulan"),
-                           (axes[1], "revenue", "Revenue per bulan")]:
-        ax.plot(monthly_df["month"], monthly_df[col], color=MAIN, linewidth=2, marker="o", markersize=5)
-        ax.scatter(peak["month"], peak[col], s=90, color=ACCENT, zorder=5, edgecolor="white", linewidth=2)
-        ax.set_title(title)
-        ax.set_ylim(bottom=0)
-    axes[1].yaxis.set_major_formatter(mtick.FuncFormatter(lambda x, p: f"R${x / 1e3:,.0f}K"))
-    axes[1].xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter("%b\n%Y"))
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+    show_chart(line_chart(monthly_df, "order_count", "Jumlah pesanan"))
+    show_chart(line_chart(monthly_df, "revenue", "Revenue (R$)",
+                          axis_label_expr=BRL_AXIS, tooltip_format=",.2f"))
 
     with st.expander("Lihat tabel data bulanan"):
-        st.dataframe(monthly_df.assign(month=monthly_df["month"].dt.strftime("%Y-%m")),
-                     hide_index=True)
+        st.dataframe(monthly_df.assign(month=monthly_df["month"].dt.strftime("%Y-%m")), hide_index=True)
 
 # ---------------------------------------------------------------------------
 # Tab 2 – Kategori produk (Pertanyaan 2)
@@ -263,74 +313,65 @@ with tab_cat:
     top_share = category_df.head(n_top)["revenue_share_pct"].sum()
     st.subheader(f"{n_top} kategori teratas menyumbang {top_share:.1f}% revenue")
 
-    top_df = category_df.head(n_top).iloc[::-1]
-    bottom_df = category_df.tail(n_top).iloc[::-1]
-    fig, axes = plt.subplots(1, 2, figsize=(14, 0.45 * n_top + 2))
-    axes[0].barh(top_df["product_category_name_english"], top_df["revenue"],
-                 color=[GREY] * (len(top_df) - 1) + [MAIN], height=0.7)
-    for y, (rev, share) in enumerate(zip(top_df["revenue"], top_df["revenue_share_pct"])):
-        axes[0].text(rev, y, f" {fmt_brl(rev)} ({share:.1f}%)", va="center", fontsize=9, color=TEXT)
-    axes[0].set_title("Revenue tertinggi")
-    axes[0].set_xlim(0, top_df["revenue"].max() * 1.45)
-    axes[0].xaxis.set_major_formatter(mtick.FuncFormatter(lambda x, p: fmt_brl(x)))
-    axes[0].xaxis.set_major_locator(mtick.MaxNLocator(4))
+    category_df["label"] = [f"{fmt_brl(r)} ({s:.1f}%)"
+                            for r, s in zip(category_df["revenue"], category_df["revenue_share_pct"])]
+    tooltip = [alt.Tooltip("product_category_name_english:N", title="Kategori"),
+               alt.Tooltip("revenue:Q", title="Revenue (R$)", format=",.2f"),
+               alt.Tooltip("order_count:Q", title="Jumlah pesanan", format=","),
+               alt.Tooltip("revenue_share_pct:Q", title="Kontribusi (%)", format=".2f")]
+    top_df = category_df.head(n_top)
+    bottom_df = category_df.tail(n_top).iloc[::-1].copy()
+    bottom_df["label"] = bottom_df["revenue"].map(fmt_brl)
+    cat = "product_category_name_english"
 
-    axes[1].barh(bottom_df["product_category_name_english"], bottom_df["revenue"],
-                 color=[ACCENT] + [GREY] * (len(bottom_df) - 1), height=0.7)
-    for y, rev in enumerate(bottom_df["revenue"]):
-        axes[1].text(rev, y, f" {fmt_brl(rev)}", va="center", fontsize=9, color=TEXT)
-    axes[1].set_title("Revenue terendah")
-    axes[1].set_xlim(0, bottom_df["revenue"].max() * 1.35)
-    axes[1].xaxis.set_major_locator(mtick.MaxNLocator(4))
-    for ax in axes:
-        ax.grid(axis="y", visible=False)
-    plt.tight_layout(w_pad=4)
-    st.pyplot(fig)
-    plt.close(fig)
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Revenue tertinggi** (biru = kategori nomor 1)")
+        show_chart(hbar_chart(top_df, cat, "revenue", "Revenue (R$)", "label", tooltip,
+                              highlight=[top_df[cat].iloc[0]], highlight_color=MAIN))
+    with right:
+        st.markdown("**Revenue terendah** (oranye = kategori paling kecil)")
+        show_chart(hbar_chart(bottom_df, cat, "revenue", "Revenue (R$)", "label", tooltip,
+                              highlight=[bottom_df[cat].iloc[0]], highlight_color=ACCENT))
 
     with st.expander("Lihat tabel semua kategori"):
-        st.dataframe(category_df, hide_index=True)
+        st.dataframe(category_df.drop(columns="label"), hide_index=True)
 
 # ---------------------------------------------------------------------------
 # Tab 3 – Pengiriman & review (Pertanyaan 3)
 # ---------------------------------------------------------------------------
 with tab_delivery:
-    delay_df = create_delay_df(order_df)
+    delay_df = create_delay_df(order_df).reset_index()
+    delay_df["delay_group"] = delay_df["delay_group"].astype(str)
     reviewed = order_df.dropna(subset=["review_score"])
     on_time = reviewed.loc[~reviewed["is_late"], "review_score"].mean()
     late = reviewed.loc[reviewed["is_late"], "review_score"].mean()
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Skor rata-rata – tepat waktu", f"{on_time:.2f}")
+    c1.metric("Skor rata-rata – tepat waktu", f"{on_time:.2f}" if pd.notna(on_time) else "–")
     c2.metric("Skor rata-rata – terlambat", f"{late:.2f}" if pd.notna(late) else "–",
-              delta=f"{late - on_time:.2f} poin" if pd.notna(late) else None)
+              delta=f"{late - on_time:.2f} poin" if pd.notna(late) and pd.notna(on_time) else None)
     c3.metric("Rata-rata lama pengiriman", f"{order_df['delivery_time_days'].mean():.1f} hari")
 
     st.subheader("Makin lama terlambat, makin rendah review score")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4.8))
-    labels = [lbl.replace(" ", "\n", 1) for lbl in delay_df.index.astype(str)]
-    colors = [MAIN] + [ACCENT] * (len(delay_df) - 1)
-    axes[0].bar(labels, delay_df["avg_review"].fillna(0), color=colors, width=0.65)
-    for i, (score, n) in enumerate(zip(delay_df["avg_review"], delay_df["order_count"])):
-        if pd.notna(score):
-            axes[0].text(i, score + 0.06, f"{score:.2f}", ha="center", fontsize=10, color=TEXT)
-        axes[0].text(i, 0.12, f"n={n:,}", ha="center", fontsize=8, color="white")
-    axes[0].set_ylim(0, 5)
-    axes[0].set_title("Rata-rata review score")
-    axes[1].bar(labels, delay_df["bad_review_pct"].fillna(0), color=colors, width=0.65)
-    for i, pct in enumerate(delay_df["bad_review_pct"]):
-        if pd.notna(pct):
-            axes[1].text(i, pct + 1.2, f"{pct:.0f}%", ha="center", fontsize=10, color=TEXT)
-    axes[1].set_ylim(0, 100)
-    axes[1].yaxis.set_major_formatter(mtick.PercentFormatter())
-    axes[1].set_title("Persentase ulasan buruk (skor 1–2)")
-    for ax in axes:
-        ax.grid(axis="x", visible=False)
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+    delay_df["score_label"] = delay_df["avg_review"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "")
+    delay_df["bad_label"] = delay_df["bad_review_pct"].map(lambda v: f"{v:.0f}%" if pd.notna(v) else "")
+    tooltip = [alt.Tooltip("delay_group:N", title="Kelompok"),
+               alt.Tooltip("order_count:Q", title="Jumlah pesanan", format=","),
+               alt.Tooltip("avg_review:Q", title="Rata-rata skor", format=".2f"),
+               alt.Tooltip("bad_review_pct:Q", title="Ulasan buruk (%)", format=".1f")]
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Rata-rata review score (1–5)**")
+        show_chart(vbar_chart(delay_df, "delay_group", "avg_review", "Rata-rata review score",
+                              [0, 5], "score_label", tooltip))
+    with right:
+        st.markdown("**Persentase ulasan buruk (skor 1–2)**")
+        show_chart(vbar_chart(delay_df, "delay_group", "bad_review_pct", "Ulasan buruk (%)",
+                              [0, 100], "bad_label", tooltip))
     st.caption("Kelompok keterlambatan dibuat dengan teknik binning (pd.cut) pada selisih tanggal "
-               "diterima dengan tanggal estimasi.")
+               "diterima dengan tanggal estimasi. Biru = tepat waktu, oranye = terlambat.")
 
 # ---------------------------------------------------------------------------
 # Tab 4 – RFM & segmentasi
@@ -339,59 +380,56 @@ with tab_rfm:
     reference_date = pd.Timestamp(end_date) + pd.Timedelta(days=1)
     if main_df["customer_unique_id"].nunique() < 5:
         st.info("Data pelanggan terlalu sedikit untuk analisis RFM. Perluas filter.")
-        st.stop()
-    rfm_df = create_rfm_df(main_df, reference_date)
+    else:
+        rfm_df = create_rfm_df(main_df, reference_date)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Rata-rata recency", f"{rfm_df['recency'].mean():.0f} hari")
-    c2.metric("Rata-rata frequency", f"{rfm_df['frequency'].mean():.2f} pesanan")
-    c3.metric("Rata-rata monetary", fmt_brl(rfm_df["monetary"].mean()))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Rata-rata recency", f"{rfm_df['recency'].mean():.0f} hari")
+        c2.metric("Rata-rata frequency", f"{rfm_df['frequency'].mean():.2f} pesanan")
+        c3.metric("Rata-rata monetary", fmt_brl(rfm_df["monetary"].mean()))
 
-    st.subheader("Pelanggan terbaik berdasarkan parameter RFM")
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
-    for ax, data, col, title in [
-        (axes[0], rfm_df.nsmallest(5, "recency"), "recency", "Recency (hari)"),
-        (axes[1], rfm_df.nlargest(5, "frequency"), "frequency", "Frequency (pesanan)"),
-        (axes[2], rfm_df.nlargest(5, "monetary"), "monetary", "Monetary (R$)"),
-    ]:
-        short_id = data["customer_unique_id"].str[:8] + "…"
-        ax.barh(short_id.iloc[::-1], data[col].iloc[::-1], color=MAIN, height=0.6)
-        for y, v in enumerate(data[col].iloc[::-1]):
-            ax.text(v, y, f" {v:,.0f}", va="center", fontsize=9, color=TEXT)
-        ax.set_xlim(0, max(data[col].max() * 1.3, 1))
-        ax.xaxis.set_major_locator(mtick.MaxNLocator(4, integer=True))
-        ax.set_title(title)
-        ax.grid(axis="y", visible=False)
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+        st.subheader("Pelanggan terbaik berdasarkan parameter RFM")
+        cols = st.columns(3)
+        for col, data, field, title in [
+            (cols[0], rfm_df.nsmallest(5, "recency"), "recency", "Recency (hari)"),
+            (cols[1], rfm_df.nlargest(5, "frequency"), "frequency", "Frequency (pesanan)"),
+            (cols[2], rfm_df.nlargest(5, "monetary"), "monetary", "Monetary (R$)"),
+        ]:
+            data = data.assign(customer=data["customer_unique_id"].str[:8] + "…",
+                               label=data[field].map(lambda v: f"{v:,.0f}"))
+            with col:
+                st.markdown(f"**{title}**")
+                show_chart(hbar_chart(data, "customer", field, title, "label",
+                                      [alt.Tooltip("customer_unique_id:N", title="ID pelanggan"),
+                                       alt.Tooltip(f"{field}:Q", title=title, format=",.2f")],
+                                      base_color=MAIN))
 
-    st.subheader("Segmentasi pelanggan (manual grouping)")
-    segment_df = (rfm_df.groupby("segment")
-                        .agg(customer_count=("customer_unique_id", "count"), revenue=("monetary", "sum"))
-                        .reindex(SEGMENT_ORDER).fillna(0))
-    segment_df["customer_pct"] = segment_df["customer_count"] / segment_df["customer_count"].sum() * 100
-    segment_df["revenue_pct"] = segment_df["revenue"] / segment_df["revenue"].sum() * 100
+        st.subheader("Segmentasi pelanggan (manual grouping)")
+        segment_df = (rfm_df.groupby("segment")
+                            .agg(customer_count=("customer_unique_id", "count"), revenue=("monetary", "sum"))
+                            .reindex(SEGMENT_ORDER).fillna(0).rename_axis("segment").reset_index())
+        segment_df["customer_pct"] = segment_df["customer_count"] / segment_df["customer_count"].sum() * 100
+        segment_df["revenue_pct"] = segment_df["revenue"] / segment_df["revenue"].sum() * 100
+        segment_df["customer_label"] = segment_df["customer_pct"].map(lambda v: f"{v:.1f}%")
+        segment_df["revenue_label"] = segment_df["revenue_pct"].map(lambda v: f"{v:.1f}%")
+        tooltip = [alt.Tooltip("segment:N", title="Segmen"),
+                   alt.Tooltip("customer_count:Q", title="Jumlah pelanggan", format=","),
+                   alt.Tooltip("revenue:Q", title="Revenue (R$)", format=",.2f")]
+        at_risk = ["Berisiko – Nilai Tinggi"]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4.5), sharey=True)
-    plot_df = segment_df.iloc[::-1]
-    colors = [ACCENT if s == "Berisiko – Nilai Tinggi" else MAIN for s in plot_df.index]
-    xmax = max(segment_df["customer_pct"].max(), segment_df["revenue_pct"].max()) * 1.2
-    for ax, col, title in [(axes[0], "customer_pct", "Porsi pelanggan"),
-                           (axes[1], "revenue_pct", "Porsi revenue")]:
-        ax.barh(plot_df.index, plot_df[col], color=colors, height=0.65)
-        for y, v in enumerate(plot_df[col]):
-            ax.text(v, y, f" {v:.1f}%", va="center", fontsize=9, color=TEXT)
-        ax.set_title(title)
-        ax.set_xlim(0, xmax)
-        ax.xaxis.set_major_formatter(mtick.PercentFormatter(decimals=0))
-        ax.grid(axis="y", visible=False)
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Porsi pelanggan (%)**")
+            show_chart(hbar_chart(segment_df, "segment", "customer_pct", "% pelanggan", "customer_label",
+                                  tooltip, highlight=at_risk, highlight_color=ACCENT, base_color=MAIN))
+        with right:
+            st.markdown("**Porsi revenue (%)**")
+            show_chart(hbar_chart(segment_df, "segment", "revenue_pct", "% revenue", "revenue_label",
+                                  tooltip, highlight=at_risk, highlight_color=ACCENT, base_color=MAIN))
+        st.caption("Oranye = segmen *Berisiko – Nilai Tinggi*: sedikit pelanggan tetapi porsi revenue besar.")
 
-    with st.expander("Aturan segmentasi"):
-        st.markdown("""
+        with st.expander("Aturan segmentasi"):
+            st.markdown("""
 | Segmen | Aturan |
 |---|---|
 | Champions | Belanja ≥ 2 kali dan R-score ≥ 4 |
@@ -422,15 +460,13 @@ with tab_geo:
 
     left, right = st.columns([3, 2])
     with left:
-        label = metric_label + (" – skala log" if use_log else "")
-        map_fig = draw_choropleth(state_df[metric_col], label, log=use_log)
-        st.pyplot(map_fig)
-        plt.close(map_fig)
+        st.markdown(f"**Peta per state – {metric_label}**" + (" (skala log)" if use_log else ""))
+        show_chart(choropleth(state_df[metric_col].dropna(), metric_label, log=use_log))
     with right:
         st.markdown(f"**Peringkat state – {metric_label}**")
         ranked = state_df[[metric_col]].sort_values(metric_col, ascending=False)
         ranked.columns = [metric_label]
-        st.dataframe(ranked.style.format("{:,.2f}"), height=470)
+        st.dataframe(ranked.style.format("{:,.2f}"), height=520)
 
     st.subheader("Persebaran lokasi pelanggan")
     points = (main_df.drop_duplicates("customer_unique_id")
