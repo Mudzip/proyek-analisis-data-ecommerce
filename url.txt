@@ -1,1 +1,1 @@
-https://GANTI-DENGAN-URL-STREAMLIT-CLOUD.streamlit.app
+https://ecommerce-dashboard-mudzip.streamlit.app/
