@@ -17,7 +17,7 @@ submission
 │   ├── dashboard.py            # aplikasi Streamlit
 │   ├── main_data.csv           # data bersih hasil notebook
 │   └── brazil_states.geojson   # batas wilayah state Brasil untuk peta
-├── data                        # 9 file CSV dataset asli + brazil_states.geojson
+├── data                        # 9 file CSV dataset asli + brazil_states.geojson (hanya di GitHub)
 ├── notebook.ipynb              # seluruh proses analisis
 ├── README.md
 ├── requirements.txt
@@ -41,7 +41,9 @@ pip install -r requirements.txt
 ```
 
 ## Menjalankan Notebook
-Jalankan `notebook.ipynb` dari dalam folder `submission` (path data bersifat relatif: `data/` dan `dashboard/`). Notebook juga menghasilkan ulang `dashboard/main_data.csv`.
+Jalankan `notebook.ipynb` dari dalam folder `submission`. Notebook juga menghasilkan ulang `dashboard/main_data.csv`.
+
+> **Catatan dataset:** folder `data/` (±125 MB) tidak disertakan di berkas zip submission karena melebihi batas upload 25 MB. Jika folder `data/` tidak ada, notebook otomatis membaca dataset yang sama dari repositori GitHub: https://github.com/Mudzip/proyek-analisis-data-ecommerce/tree/main/data (butuh koneksi internet). Dashboard tidak memerlukan folder `data/` karena memakai `dashboard/main_data.csv`.
 
 ## Run Streamlit App
 ```
